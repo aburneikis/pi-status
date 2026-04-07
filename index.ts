@@ -132,8 +132,8 @@ function fmtLimit(label: string, limit?: RateLimit): string | null {
 
 function buildParts(data: UsageData): string[] {
 	return [
-		fmtLimit("session", data.five_hour),
-		fmtLimit("week", data.seven_day),
+		fmtLimit("sn", data.five_hour),
+		fmtLimit("wk", data.seven_day),
 	].filter((p): p is string => p !== null);
 }
 
@@ -222,7 +222,18 @@ export default function (pi: ExtensionAPI) {
 						contextStr = contextDisplay;
 					}
 
-					const left = `$${totalCost.toFixed(3)}  ${contextStr}`;
+					// ── cc-usage inline ──────────────────────────────────────
+					let usageStr = "";
+					if (usageData) {
+						const parts = buildParts(usageData);
+						if (parts.length > 0) {
+							const worst = worstPct(usageData);
+							const colorKey = worst >= 80 ? "error" : worst >= 50 ? "warning" : "success";
+							usageStr = "  " + theme.fg(colorKey, parts.join(" "));
+						}
+					}
+
+					const left = `$${totalCost.toFixed(3)}  ${contextStr}${usageStr}`;
 
 					// ── Model + thinking ──────────────────────────────────────
 					const modelName = ctx.model?.id || "no-model";
@@ -263,21 +274,6 @@ export default function (pi: ExtensionAPI) {
 							.map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
 							.join(" ");
 						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
-					}
-
-					// ── cc-usage line ─────────────────────────────────────────
-					if (usageError) {
-						lines.push(theme.fg("dim", `CC: ${usageError}`));
-					} else if (usageData) {
-						const parts = buildParts(usageData);
-						if (parts.length > 0) {
-							const worst = worstPct(usageData);
-							const colorKey = worst >= 80 ? "error" : worst >= 50 ? "warning" : "success";
-							const usageLine = `CC ${parts.join(" | ")}`;
-							lines.push(truncateToWidth(theme.fg(colorKey, usageLine), width, theme.fg("dim", "...")));
-						}
-					} else {
-						lines.push(theme.fg("dim", "CC: loading…"));
 					}
 
 					return lines;
