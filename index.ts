@@ -179,7 +179,7 @@ function buildParts(data: UsageData): string[] {
   // Show soonest reset time (prefer 5-hour window if active)
   const resetStr =
     fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`⟳ ${resetStr}`);
+  if (resetStr) parts.push(`r:${resetStr}`);
 
   return parts;
 }
