@@ -39,7 +39,7 @@ const USAGE_CACHE_PATH = join(homedir(), ".claude", ".pi-usage-cache.json");
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const API_URL = "https://api.anthropic.com/api/oauth/usage";
-const POLL_INTERVAL_MS = 60_000;
+const POLL_INTERVAL_MS = 120_000;
 const CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
 function readCreds(): any {
@@ -109,6 +109,7 @@ interface UsageCache {
   timestamp: number;
   data: UsageData;
   rate_limited_until?: number;
+  rate_limit_count?: number;
 }
 
 function readUsageCache(): UsageCache | null {
@@ -227,7 +228,21 @@ export default function (pi: ExtensionAPI) {
           tokens = await refreshTokens(tokens);
         }
         usageData = await fetchUsage(tokens);
-        writeUsageCache(usageData);
+        // Successful fetch — reset rate-limit counter
+        try {
+          const existing = readUsageCache();
+          if (existing?.rate_limit_count) {
+            writeFileSync(
+              USAGE_CACHE_PATH,
+              JSON.stringify({ timestamp: Date.now(), data: usageData }),
+              "utf8",
+            );
+          } else {
+            writeUsageCache(usageData);
+          }
+        } catch {
+          writeUsageCache(usageData);
+        }
         usageError = null;
       } catch (err: any) {
         const msg: string = err?.message ?? "unknown error";
@@ -236,11 +251,14 @@ export default function (pi: ExtensionAPI) {
         if (msg.includes("429")) {
           try {
             const existing = readUsageCache();
-            const backoffMs = 5 * 60_000;
+            const count = (existing?.rate_limit_count ?? 0) + 1;
+            const backoffMs =
+              count === 1 ? 5 * 60_000 : count === 2 ? 10 * 60_000 : 30 * 60_000;
             const patched: UsageCache = {
               timestamp: existing?.timestamp ?? Date.now(),
               data: existing?.data ?? {},
               rate_limited_until: Date.now() + backoffMs,
+              rate_limit_count: count,
             };
             writeFileSync(USAGE_CACHE_PATH, JSON.stringify(patched), "utf8");
             if (existing?.data) usageData = existing.data;
