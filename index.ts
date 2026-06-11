@@ -189,7 +189,17 @@ function buildParts(data: UsageData): string[] {
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  let stopPolling: (() => void) | null = null;
+
+  pi.on("session_shutdown", () => {
+    stopPolling?.();
+    stopPolling = null;
+  });
+
   pi.on("session_start", (_event, ctx) => {
+    // Stop any poller from a previous session bind
+    stopPolling?.();
+
     // cc-usage polling state
     let tokens: OAuthTokens | null = loadTokens();
     let usageData: UsageData | null = null;
@@ -271,9 +281,19 @@ export default function (pi: ExtensionAPI) {
       renderFn?.();
     }
 
-    // Kick off polling
+    // Kick off polling. unref() so the timer does not keep the process
+    // alive in print mode (-p), where the footer is never mounted and its
+    // dispose() never runs.
     pollUsage();
     pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
+    (pollTimer as unknown as { unref?: () => void }).unref?.();
+    stopPolling = () => {
+      renderFn = null;
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       const unsub = footerData.onBranchChange(() => tui.requestRender());
