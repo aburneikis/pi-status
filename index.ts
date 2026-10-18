@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
 // ─── cc-usage types ───────────────────────────────────────────────────────────
@@ -26,81 +26,19 @@ interface UsageData {
   extra_usage?: ExtraUsage;
 }
 
-interface OAuthTokens {
-  accessToken: string;
-  refreshToken?: string;
-  expiresAt?: number;
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ─── Token management ─────────────────────────────────────────────────────────
-
-const CREDS_PATH = join(homedir(), ".claude", ".credentials.json");
 const USAGE_CACHE_PATH = join(homedir(), ".claude", ".pi-usage-cache.json");
-const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const API_URL = "https://api.anthropic.com/api/oauth/usage";
 const POLL_INTERVAL_MS = 120_000;
 const CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
-function readCreds(): any {
-  return JSON.parse(readFileSync(CREDS_PATH, "utf8"));
-}
-
-function writeCreds(creds: any): void {
-  writeFileSync(CREDS_PATH, JSON.stringify(creds, null, 2), "utf8");
-}
-
-function loadTokens(): OAuthTokens | null {
-  try {
-    const oauth = readCreds()?.claudeAiOauth;
-    if (!oauth?.accessToken) return null;
-    return oauth as OAuthTokens;
-  } catch {
-    return null;
-  }
-}
-
-function isExpired(tokens: OAuthTokens): boolean {
-  if (!tokens.expiresAt) return false;
-  return Date.now() >= tokens.expiresAt - 60_000;
-}
-
-async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: tokens.refreshToken,
-      client_id: CLIENT_ID,
-    }),
-    signal: AbortSignal.timeout(15_000),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Token refresh failed (${res.status}): ${body.slice(0, 200)}`,
-    );
-  }
-
-  const data = await res.json();
-  const newTokens: OAuthTokens = {
-    ...tokens,
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token ?? tokens.refreshToken,
-    expiresAt: Date.now() + data.expires_in * 1000,
-  };
-
-  try {
-    const creds = readCreds();
-    creds.claudeAiOauth = newTokens;
-    writeCreds(creds);
-  } catch {
-    // non-fatal
-  }
-
-  return newTokens;
+// pi's own Anthropic login. pi refreshes it under its auth.json lock, so
+// this never races pi (or the PiOS daemon) over a rotating refresh token.
+async function loadToken(ctx: ExtensionContext): Promise<string | null> {
+  const key = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
+  // Plan usage needs a subscription (OAuth) login; an API key cannot read it.
+  return key?.startsWith("sk-ant-oat") ? key : null;
 }
 
 // ─── Usage cache ─────────────────────────────────────────────────────────────
@@ -129,10 +67,10 @@ function writeUsageCache(data: UsageData): void {
   }
 }
 
-async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
+async function fetchUsage(token: string): Promise<UsageData> {
   const res = await fetch(API_URL, {
     headers: {
-      Authorization: `Bearer ${tokens.accessToken}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       "anthropic-beta": "oauth-2025-04-20",
     },
@@ -197,11 +135,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    // Stop any poller from a previous session bind
     stopPolling?.();
 
     // cc-usage polling state
-    let tokens: OAuthTokens | null = loadTokens();
     let usageData: UsageData | null = null;
     let usageError: string | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -228,16 +164,13 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Cache is stale or missing — fetch fresh data
-        tokens = loadTokens();
-        if (!tokens) {
+        const token = await loadToken(ctx);
+        if (!token) {
           usageError = "no creds";
           renderFn?.();
           return;
         }
-        if (isExpired(tokens)) {
-          tokens = await refreshTokens(tokens);
-        }
-        usageData = await fetchUsage(tokens);
+        usageData = await fetchUsage(token);
         // Successful fetch — reset rate-limit counter
         try {
           const existing = readUsageCache();
@@ -281,19 +214,27 @@ export default function (pi: ExtensionAPI) {
       renderFn?.();
     }
 
-    // Kick off polling. unref() so the timer does not keep the process
-    // alive in print mode (-p), where the footer is never mounted and its
-    // dispose() never runs.
-    pollUsage();
-    pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
-    (pollTimer as unknown as { unref?: () => void }).unref?.();
-    stopPolling = () => {
+    const stop = () => {
       renderFn = null;
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
       }
     };
+    stopPolling = stop;
+
+    // In non-interactive / print mode (`pi -p`) there is no TUI footer, so
+    // the footer's dispose() never runs to clear the poll timer. A live
+    // setInterval keeps the Node event loop alive and the process hangs after
+    // printing. Detect headless mode and skip background polling entirely.
+    const isHeadless = !process.stdout.isTTY || !ctx.ui?.setFooter;
+    if (!isHeadless) {
+      // Kick off polling
+      pollUsage();
+      pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
+      // Defensive: never let the timer keep the process alive on its own.
+      pollTimer.unref?.();
+    }
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       const unsub = footerData.onBranchChange(() => tui.requestRender());
@@ -304,11 +245,7 @@ export default function (pi: ExtensionAPI) {
       return {
         dispose: () => {
           unsub();
-          renderFn = null;
-          if (pollTimer) {
-            clearInterval(pollTimer);
-            pollTimer = null;
-          }
+          stop();
         },
         invalidate() {},
         render(width: number): string[] {
