@@ -127,7 +127,16 @@ function buildParts(data: UsageData): string[] {
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  let stopPolling: (() => void) | null = null;
+
+  pi.on("session_shutdown", () => {
+    stopPolling?.();
+    stopPolling = null;
+  });
+
   pi.on("session_start", (_event, ctx) => {
+    stopPolling?.();
+
     // cc-usage polling state
     let usageData: UsageData | null = null;
     let usageError: string | null = null;
@@ -205,6 +214,15 @@ export default function (pi: ExtensionAPI) {
       renderFn?.();
     }
 
+    const stop = () => {
+      renderFn = null;
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+    stopPolling = stop;
+
     // In non-interactive / print mode (`pi -p`) there is no TUI footer, so
     // the footer's dispose() never runs to clear the poll timer. A live
     // setInterval keeps the Node event loop alive and the process hangs after
@@ -227,11 +245,7 @@ export default function (pi: ExtensionAPI) {
       return {
         dispose: () => {
           unsub();
-          renderFn = null;
-          if (pollTimer) {
-            clearInterval(pollTimer);
-            pollTimer = null;
-          }
+          stop();
         },
         invalidate() {},
         render(width: number): string[] {
